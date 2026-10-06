@@ -1,0 +1,10 @@
+services:
+  uber-eats-scraper:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      # Optional — set it when Uber Eats starts answering 403 (per-IP reCAPTCHA wall).
+      # - UBER_EATS_PROXY=http://user:pass@host:port
