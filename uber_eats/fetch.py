@@ -27,10 +27,20 @@ search calls from one address those RPCs answer HTTP 403
 {"status":"failure","metadata":{"botdefense":{"state":"challenge",
 "provider":"RECAPTCHA"}}} (seen 2026-10-05; the directory RPCs and the
 address box kept answering 200, and no TLS profile or cookie set clears it).
-A fresh residential exit passes. So on a 403/429 or an HTML page a worker
-moves its session to a sticky residential exit
-(config.uber_eats_fallback_proxy()) for config.UBER_EATS_BLOCK_COOLDOWN
-seconds, the same shape as the kick transport.
+A fresh residential exit passes, and so does the gateway
+(exit_gateway.py: a fresh gateway address on nearly every request, so a per-IP
+count never builds up). So on a 403/429 or an HTML page the sessions move
+one fallback step down for config.UBER_EATS_BLOCK_COOLDOWN seconds: since
+2026-11-11 first to the gateway (config.UBER_EATS_FALLBACK_EXIT = "gateway";
+the numbers are in config.py's Uber Eats block), and only when that is
+refused too to a sticky residential exit
+(config.UBER_EATS_FALLBACK_PROXY_COUNTRY). A call the gateway keeps failing
+makes its LAST retry on the residential exit, for that call only. When the
+cooldown ends the next call is back on the server's own IP. The same shape
+as the reed / soundcloud / woolworths transports. Every step is a US
+address on purpose: the address box (mapsSearchV1) answers a US caller from
+Uber's own place index ("uber_places") and an Indian one from Google's
+("google_places"), with different place ids and slightly different points.
 
 Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   UberEatsUpstreamError  transport failure / 5xx / RPC failure   — retryable
@@ -43,13 +53,15 @@ import os
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_futures
 from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+import egress
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
+from scraper_utils import debug, fanout, ladder, retry, sessions
 
 SITE = "https://www.ubereats.com"
 API = SITE + "/_p/api/"
@@ -61,7 +73,7 @@ FANOUT_WORKERS = 6
 
 HEADERS = {
     "accept": "*/*",
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": egress.site_accept_language("uber-eats"),
     "content-type": "application/json",
     "origin": SITE,
     "x-csrf-token": "x",
@@ -90,62 +102,87 @@ class UberEatsNotFound(NotFound):
 
 
 # ---- sessions ------------------------------------------------------------------
-# One curl session per worker thread. Direct egress by default; after a block
-# the thread's sessions go through a sticky residential exit for a cooldown.
+# One session per worker thread (egress.new_session: curl_cffi, or the gateway
+# exit's look-alike). Direct egress by default; after a block the sessions
+# move down the fallback steps (config.uber_eats_fallback_exits(): the gateway
+# exit, then a sticky residential exit) until `_fallback_until`, then go
+# back to direct.
 _local = threading.local()
 _fallback_until = 0.0
+_fallback_step = 1              # which fallback exit serves while the cooldown runs (1 = the first)
 _fallback_lock = threading.Lock()
 
 
-def _proxy_for_new_session():
+def _gateway_step(step):
+    """True when fallback step `step` is the gateway exit with another exit
+    configured behind it."""
+    exits = config.uber_eats_fallback_exits()
+    return 0 < step < len(exits) and bool(config.gateway_exit(exits[step - 1]))
+
+
+def _step():
+    """The fallback step a session built NOW rides: 0 = the configured exit
+    (the server's own IP), 1, 2 = config.uber_eats_fallback_proxy(step)
+    while the cooldown runs; one step past the gateway for the last retry of
+    a call (_retrying)."""
+    return ladder.current_step(_fallback_step, _fallback_until, _local, _gateway_step)
+
+
+def _proxy_for_new_session(step=None):
     forced = config.uber_eats_proxy()
     if forced:
         return forced
-    if time.time() < _fallback_until:
-        return config.uber_eats_fallback_proxy()
-    return None
+    step = _step() if step is None else step
+    return config.uber_eats_fallback_proxy(step) if step else None
 
 
 def _session():
     sess = getattr(_local, "session", None)
+    step = _step()
+    if sess is not None and getattr(sess, "_uber_eats_step", 0) != step:
+        # 2026-11-11: a session follows its step. Before, a thread that took
+        # the fallback exit during a cooldown stayed on it until that failed.
+        _drop_session()
+        sess = None
     if sess is None:
-        from curl_cffi import requests as curl_requests
-        sess = curl_requests.Session(impersonate=IMPERSONATE)
-        proxy = _proxy_for_new_session()
-        if proxy:
-            sess.proxies = {"http": proxy, "https": proxy}
+        # None (direct), a proxy URL, or the gateway exit ("gateway")
+        sess = egress.new_session(_proxy_for_new_session(step), impersonate=IMPERSONATE)
+        sess._uber_eats_step = step
         _local.session = sess
     return sess
 
 
 def _drop_session():
-    sess = getattr(_local, "session", None)
-    _local.session = None
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
+    sessions.drop(_local)
 
 
 def _note_block():
-    """A 403/429 on direct egress: send new sessions through a residential
-    exit for a while (no-op when no fallback country is configured)."""
-    global _fallback_until
-    if config.uber_eats_fallback_proxy() is not None:
-        with _fallback_lock:
-            _fallback_until = time.time() + config.UBER_EATS_BLOCK_COOLDOWN
+    """The exit this thread's session rides was refused: new sessions move
+    one fallback step down for a cooldown (own IP -> the gateway exit ->
+    residential; on the last step they stay there, each on a fresh exit).
+    No-op when no fallback is configured."""
+    global _fallback_until, _fallback_step
+    exits = config.uber_eats_fallback_exits()
+    if not exits:
+        return
+    held = getattr(getattr(_local, "session", None), "_uber_eats_step", _step())
+    if getattr(_local, "past_gateway", False) and held > (_fallback_step if time.time() < _fallback_until else 0):
+        # the last retry of a call the gateway kept failing rides the step past
+        # it for that call only: a refusal there is no verdict on the gateway,
+        # so it must not move every session onto the residential exit
+        return
+    step = min(held + 1, len(exits))
+    with _fallback_lock:
+        if time.time() >= _fallback_until or step > _fallback_step:
+            _fallback_step = step
+        _fallback_until = time.time() + config.UBER_EATS_BLOCK_COOLDOWN
+    if len(exits) > 1:      # how often each step is refused is the number to watch
+        print(f"uber-eats: exit refused, sessions on fallback step {_fallback_step} "
+              f"({exits[_fallback_step - 1]}) for {config.UBER_EATS_BLOCK_COOLDOWN} s")
 
 
 def dump_debug(name, text):
-    dbg = os.environ.get("UBER_EATS_DEBUG_DIR", "")
-    if dbg and text:
-        try:
-            os.makedirs(dbg, exist_ok=True)
-            with open(os.path.join(dbg, name + ".txt"), "w", encoding="utf-8") as f:
-                f.write(text)
-        except OSError:
-            pass
+    debug.dump("UBER_EATS_DEBUG_DIR", name, text, encoding="utf-8")
 
 
 # ---- cookies -------------------------------------------------------------------
@@ -183,16 +220,11 @@ def _raise_failure(body, label):
 
 
 def _retrying(fn):
-    last = None
-    for attempt in range(1, config.MAX_RETRIES + 1):
-        try:
-            return fn()
-        except UberEatsUpstreamError as e:      # includes UberEatsBlocked
-            last = e
-            _drop_session()
-        if attempt < config.MAX_RETRIES:
-            time.sleep(config.RETRY_BACKOFF * attempt)
-    raise last
+    """Run fn() under the shared retry policy, each retry on a fresh session
+    / exit. While the sessions are on the gateway exit step the LAST retry of
+    a call rides the next step (the residential exit), for that call only:
+    a gateway failure then costs latency, not the call."""
+    return retry.run_flagged(fn, config, UberEatsUpstreamError, lambda e: _drop_session(), _local)
 
 
 def rpc(name, body=None, *, locale=None, point=None, dining_mode=None, referer=None, label=None):
@@ -260,14 +292,30 @@ def rpc_optional(name, body=None, **kwargs):
 
 # ---- fan-out -------------------------------------------------------------------
 
+# Long-lived pools (2026-10-23): their threads keep their thread-local curl
+# sessions — and the sticky exits behind them — between requests. The
+# per-call executor they replace opened fresh sessions/exits for every
+# fan-out and threw them away when the call returned. Two levels: a fan-out
+# running inside a fan-out goes to the second pool, so it neither waits on
+# the workers it occupies (deadlock) nor loses its parallelism; a third
+# level runs inline.
+_pools = (ThreadPoolExecutor(max_workers=FANOUT_WORKERS * 4, thread_name_prefix="uber_eats-fanout-0"),
+          ThreadPoolExecutor(max_workers=FANOUT_WORKERS * 4, thread_name_prefix="uber_eats-fanout-1"))
+
+
+def _windowed(fns, workers):
+    """Run `fns` on the pool for this nesting level, at most `workers` at a
+    time; results align with `fns`. The first failure (in `fns` order)
+    propagates once the callables already started have finished."""
+    return fanout.windowed(_pools, "uber_eats-fanout", fns, workers)
+
+
 def run_parallel(fns):
     if not fns:
         return []
     if len(fns) == 1:
         return [fns[0]()]
-    with ThreadPoolExecutor(max_workers=min(FANOUT_WORKERS, len(fns))) as ex:
-        futures = [ex.submit(fn) for fn in fns]
-        return [f.result() for f in futures]
+    return _windowed(fns, FANOUT_WORKERS)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,16 @@ def uber_eats_proxy():
     return os.environ.get("UBER_EATS_PROXY") or None
 
 
-def uber_eats_fallback_proxy():
+def uber_eats_fallback_proxy(*args, **kwargs):
     """Proxy a worker falls back to after a block (None = no fallback)."""
     return os.environ.get("UBER_EATS_PROXY") or None
+
+
+# ---- added by the sync: defaults for a direct run ----
+def gateway_exit(exit=None):
+    return None
+
+
+def uber_eats_fallback_exits():
+    return ()
+

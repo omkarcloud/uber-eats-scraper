@@ -7,6 +7,7 @@ from collections import OrderedDict
 
 from uber_eats import parsers as P
 from uber_eats.fetch import UberEatsNotFound, rpc
+from scraper_utils import memo as memo_utils
 
 POINT_TTL = 24 * 3600
 STORE_TTL = 120
@@ -34,8 +35,7 @@ def memo(key, ttl, build):
 
 
 def remember(key, ttl, value):
-    with _lock:
-        _memo[key] = (time.time() + ttl, value)
+    memo_utils.remember(_memo, _lock, key, ttl, value)
 
 
 def recall(key):

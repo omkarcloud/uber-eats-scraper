@@ -44,6 +44,7 @@ import re
 from datetime import datetime, timezone
 
 from uber_eats import refs
+from scraper_utils.values import as_dict, as_list, num as to_float, to_int
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _NUM_RE = re.compile(r"\d[\d.,   ]*\d|\d")
@@ -53,23 +54,7 @@ _COUNT_IN_TEXT_RE = re.compile(r"(\d[\d,]*)")
 
 
 # ---- value helpers ------------------------------------------------------------
-# (kept local so the package stands alone, like the other site packages)
-
-def to_int(value):
-    try:
-        return int(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return None
-
-
-def to_float(value):
-    try:
-        return float(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
+# (the generic ones come from scraper_utils; the rest are the site's own)
 
 
 def text(value):
@@ -85,14 +70,6 @@ def text(value):
 def lower(value):
     value = text(value)
     return value.lower() if value else None
-
-
-def as_list(value):
-    return value if isinstance(value, list) else []
-
-
-def as_dict(value):
-    return value if isinstance(value, dict) else {}
 
 
 def money(cents):
